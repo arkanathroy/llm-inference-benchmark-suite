@@ -1,0 +1,46 @@
+# ---- Core ----
+torch==2.3.1
+transformers==4.42.3
+accelerate==0.31.0
+sentencepiece==0.2.0
+safetensors==0.4.3
+
+# ---- Quantization ----
+bitsandbytes==0.43.1
+auto-gptq==0.7.1
+autoawq==0.2.5
+optimum==1.20.0
+
+# ---- Serving ----
+vllm==0.5.0
+ray==2.24.0
+
+# ---- Load testing / benchmarking ----
+locust==2.29.1
+numpy==1.26.4
+pandas==2.2.2
+matplotlib==3.9.0
+plotly==5.22.0
+
+# ---- Evaluation ----
+lm-eval==0.4.3
+evaluate==0.4.2
+datasets==2.20.0
+scikit-learn==1.5.0
+
+# ---- GPU monitoring ----
+nvidia-ml-py==12.560.30
+pynvml==11.5.0
+gpustat==1.1.1
+
+# ---- API / orchestration ----
+fastapi==0.111.0
+uvicorn==0.30.1
+httpx==0.27.0
+aiohttp==3.9.5
+pydantic==2.7.4
+
+# ---- Utilities ----
+tqdm==4.66.4
+python-dotenv==1.0.1
+rich==13.7.1
