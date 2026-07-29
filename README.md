@@ -1,160 +1,128 @@
-# LLM Inference Optimization Benchmark Suite
+# LLM Inference Benchmark Suite
 
-Project 3 of a 4-project GPU/ML Systems Engineer portfolio, built to
-demonstrate hands-on proficiency with the exact tech stack named in a
-target GPU/ML Systems Engineer job description: **vLLM, TensorRT-LLM,
-model quantization (INT8/FP16/GPTQ/AWQ), Locust load testing, GPU
-profiling (DCGM-equivalent), and cost-per-token benchmark reporting.**
+A hands-on benchmarking project comparing **inference speed, memory footprint, and output quality**
+across five ways of running the same open-weight LLM:
 
-## What This Project Demonstrates
+| # | Technique                | Library              | Precision            |
+|---|---------------------------|-----------------------|------------------------|
+| 1 | FP16 baseline              | Hugging Face Transformers | fp16                |
+| 2 | GPTQ                       | GPTQModel              | 4-bit (INT4)          |
+| 3 | AWQ                         | AutoAWQ                | 4-bit (INT4)          |
+| 4 | GGUF                        | llama.cpp / llama-cpp-python | 4/5/8-bit (Q4_K_M, Q5_K_M, Q8_0) |
+| 5 | TensorRT-LLM engine         | TensorRT-LLM            | fp16 / INT8 / INT4 (AWQ-in-TRT) |
 
-A systematic, end-to-end benchmark of **Llama-3.2-3B-Instruct** across
-every layer of the LLM inference optimization stack:
+Serving throughput for the HF/GPTQ/AWQ/GGUF paths is measured through **vLLM's** OpenAI-compatible
+server (PagedAttention, continuous batching, chunked prefill), while the TensorRT-LLM path uses
+its own native runtime, since vLLM does not execute compiled TRT engines directly.
 
-1. **Quantization tradeoffs** — FP16 baseline vs INT8 (bitsandbytes) vs
-   GPTQ (4-bit) vs AWQ (4-bit), measured on memory footprint, raw
-   inference speed, perplexity, and MMLU task accuracy.
-2. **Serving engine gains** — vLLM's PagedAttention, continuous
-   batching, and chunked prefill layered on top of each precision
-   variant.
-3. **Load testing under realistic concurrency** — a Locust-driven
-   sweep (1 → 32 concurrent users) that exposes the exact concurrency
-   level where latency "cliffs" — the point where the serving engine's
-   KV cache capacity saturates and requests start queueing.
-4. **GPU telemetry** — utilization, VRAM, power, and clock speed
-   captured during the load test, using a `pynvml`-based collector that
-   maps 1:1 onto real DCGM field names (since Colab has no DCGM daemon
-   available).
-5. **Cost-per-token reporting** — measured throughput translated into
-   USD-per-million-tokens across 6 real AWS/Colab instance price points,
-   producing an actionable "which instance should I deploy on" table.
-6. **(Optional) TensorRT-LLM compilation** — gated behind a GPU
-   architecture check, runnable on Colab Pro/A100 to compare compiled-
-   engine throughput against vLLM.
+## Why one virtualenv per technique
 
-## Why Llama-3.2-3B, Not a Larger Model
+Earlier iterations of this project tried to install every quantization backend
+(AutoGPTQ, AutoAWQ, Optimum, vLLM, TensorRT-LLM) into a **single environment**.
+This consistently failed because these libraries pin **mutually incompatible
+versions of `torch` and `transformers`**:
 
-Colab's free-tier T4 GPU has 16GB of VRAM. A 7B model in FP16 alone
-consumes ~14GB, leaving no room for KV cache or activation memory
-during concurrent request testing. **3B in FP16 uses ~6GB**, leaving
-roughly 10GB of headroom to run four precision variants, a vLLM engine
-with KV cache, and a 32-way concurrency sweep — all within free
-infrastructure.
+- `vllm` needs a torch build matching its compiled CUDA kernels (flash-attn / xformers).
+- `GPTQModel` / `AutoAWQ` prebuilt CUDA kernels are compiled against a specific torch ABI.
+- `TensorRT-LLM` ships its own pinned `torch` build tied to a specific CUDA Toolkit (13.x).
+- `peft`/`accelerate`/`optimum` shift their own transformers floor and ceiling with every release.
 
-The methodology (not the absolute numbers) is what transfers to
-production scale: the same benchmark structure run against a 70B model
-on 8xA100/H100 would surface the same categories of bottlenecks
-(prefill/decode contention, KV cache saturation, quantization accuracy
-tradeoffs), just at different absolute latency/throughput values. This
-mirrors the reference job posting's own benchmark examples ("0.41s
-TTFT on Llama 70B") — the skill being demonstrated is the benchmarking
-*methodology*, reproducible on any GPU tier.
+Trying to satisfy all of these simultaneously in one resolver run is not solvable — the
+constraints are genuinely contradictory, not just "pinned too tight." The fix used
+throughout this repo is **one isolated Python virtual environment per technique**,
+each with its own self-consistent, unpinned-to-latest-stable dependency set. A thin
+orchestration layer (`src/env_runner.py`) invokes each venv's interpreter directly, so
+the top-level orchestrator notebook never needs to resolve cross-technique
+dependencies at all.
 
-## Repository Structure
+```
+envs/
+  fp16/         -> transformers + vllm only
+  gptq/         -> GPTQModel + transformers + vllm
+  awq/          -> autoawq + transformers + vllm
+  gguf/         -> llama-cpp-python (built with CUDA) + huggingface_hub
+  trtllm/       -> tensorrt_llm + its pinned torch/CUDA 13 stack
+```
+
+Each environment is built fresh by its own `envs/<name>/setup.sh` script, using
+**latest stable releases** at build time (no hand-picked legacy pins), so the
+project stays reproducible without freezing to any one point-in-time snapshot
+that will eventually rot as upstream projects move forward.
+
+## Repository layout
 
 ```
 llm-inference-benchmark-suite/
 ├── README.md
-├── requirements.txt
-├── notebooks/
-│   └── llm_inference_benchmark_colab.ipynb   <- Main deliverable, run top-to-bottom on Colab T4
-├── src/
-│   ├── config.py              <- Every hyperparameter, documented with WHAT/WHY/EFFECT
-│   ├── quantize.py             <- FP16 / INT8 / GPTQ / AWQ load + quantize functions
-│   ├── evaluate.py             <- Perplexity (WikiText-2) + MMLU accuracy evaluation
-│   ├── benchmark_runner.py     <- TTFT/TPOT/throughput measurement harness (async)
-│   ├── prompt_generator.py     <- Synthetic prompt generator (controlled token-length mix)
-│   ├── vllm_server.py          <- vLLM AsyncLLMEngine + OpenAI-server launcher
-│   ├── trtllm_bench.py         <- TensorRT-LLM benchmark harness (Colab Pro/A100 only)
-│   ├── gpu_monitor.py          <- pynvml-based DCGM-equivalent telemetry collector
-│   └── plotting.py             <- Plotly chart generation for the final report
 ├── configs/
-│   └── locustfile.py           <- Locust load test definition (targets vLLM's OpenAI API)
-└── benchmarks/                 <- Output directory: CSVs, PNGs, BENCHMARK_REPORT.md
+│   ├── benchmark_config.yaml       # model id, prompts, batch sizes, output paths
+│   └── sample_prompts.txt
+├── envs/
+│   ├── fp16/setup.sh
+│   ├── gptq/setup.sh
+│   ├── awq/setup.sh
+│   ├── gguf/setup.sh
+│   └── trtllm/setup.sh
+├── src/
+│   ├── gpu_monitor.py               # NVML-based GPU telemetry (util%, VRAM, power, temp)
+│   ├── env_runner.py                 # subprocess bridge: run a script inside a given venv
+│   ├── quantize_gptq.py              # GPTQModel quantization script (runs inside envs/gptq)
+│   ├── quantize_awq.py               # AutoAWQ quantization script (runs inside envs/awq)
+│   ├── convert_gguf.py               # HF -> GGUF conversion + llama.cpp quantize (envs/gguf)
+│   ├── build_trtllm_engine.py        # TensorRT-LLM engine build script (envs/trtllm)
+│   ├── vllm_server.py                 # start/stop a vLLM OpenAI-compatible server
+│   ├── llamacpp_server.py             # start/stop a llama.cpp server for GGUF models
+│   ├── trtllm_bench.py                # native TensorRT-LLM throughput/latency harness
+│   └── benchmark_runner.py            # unified load generator + metrics collector (all backends)
+├── notebooks/
+│   └── llm_inference_benchmark_colab.ipynb   # orchestrator notebook (Colab, A100 recommended)
+├── results/                          # CSV/JSON outputs + plots land here
+└── docs/
+    └── environment_notes.md          # troubleshooting notes specific to Colab GPU runtimes
 ```
 
-## Quickstart (Google Colab)
+## Hardware target
 
-1. Open `notebooks/llm_inference_benchmark_colab.ipynb` in Colab.
-2. **Runtime > Change runtime type > T4 GPU** (free tier is sufficient
-   for Phases 1-8).
-3. Add your HuggingFace token to Colab Secrets as `HF_TOKEN` (key icon,
-   left sidebar) — Llama-3.2 is a gated model requiring license
-   acceptance at https://huggingface.co/meta-llama/Llama-3.2-3B-Instruct.
-4. Run cells top to bottom. Phase 2 (GPTQ/AWQ calibration) takes
-   5-10 minutes each on first run; results are cached to Google Drive
-   so subsequent runs skip re-calibration.
-5. Phase 9 (TensorRT-LLM) requires switching to a Colab Pro A100
-   runtime — the notebook raises a clear assertion error if run on T4
-   rather than silently failing partway through compilation.
+Built and tested against a **Google Colab A100 (40GB)** runtime. A T4 (16GB) runtime
+also works for the FP16/GPTQ/AWQ/GGUF phases with a smaller model (<=3B parameters),
+but the TensorRT-LLM phase requires an A100/H100-class GPU (Ampere or newer, SM80+)
+since TensorRT-LLM's prebuilt kernels drop support for older architectures.
 
-## Key Parameter Decisions (Summary — full rationale in `src/config.py`)
+## Quickstart (Colab)
 
-| Parameter | Value | One-line rationale |
-|---|---|---|
-| `gpu_memory_utilization` | 0.85 | Leaves safety margin below vLLM's 0.9 default on a T4 shared with notebook kernel overhead |
-| `block_size` (PagedAttention) | 16 | vLLM's empirically validated default across GPU architectures |
-| `max_num_seqs` | 32 | Matched to the top of the Locust concurrency sweep so batching isn't artificially capped below the tested load |
-| `max_num_batched_tokens` | 8192 | 2x max_model_len — gives the scheduler room to interleave one long prefill with ongoing decodes without starving them |
-| `enable_chunked_prefill` | True | Prevents one long prompt from blocking TTFT for every other concurrent user |
-| GPTQ `group_size` | 128 | Standard from the original paper; balances accuracy vs scale-factor memory overhead |
-| GPTQ `desc_act` | False | Required False for compatibility with vLLM's fused GPTQ kernel — a real, documented gotcha |
-| AWQ `zero_point` | True | Matches every published AWQ checkpoint; correctly represents asymmetric weight distributions post-scaling |
-| Locust `concurrency_levels` | (1,2,4,8,16,32) | Doubling sweep — performance cliffs in batched serving are log-linear phenomena, not linear |
-| INT8 `llm_int8_threshold` | 6.0 | Original LLM.int8() paper's empirically found outlier-isolation threshold |
+```python
+!git clone https://github.com/arkanathroy/llm-inference-benchmark-suite.git
+%cd llm-inference-benchmark-suite
+!bash envs/fp16/setup.sh
+!bash envs/gptq/setup.sh
+!bash envs/awq/setup.sh
+!bash envs/gguf/setup.sh
+# TensorRT-LLM only if you have an A100/H100 runtime:
+!bash envs/trtllm/setup.sh
+```
 
-## GPU Metrics: Colab pynvml vs Production DCGM
+Then open `notebooks/llm_inference_benchmark_colab.ipynb` and run the phases in order.
+Each phase cell calls into its own venv via `src/env_runner.py`, so no single Python
+process ever imports two conflicting quantization backends.
 
-Colab's sandboxed runtime has no root/systemd access, so the real DCGM
-daemon (`dcgm-exporter`) cannot run. `src/gpu_monitor.py` polls the same
-underlying NVIDIA driver counters via `pynvml` at 200ms resolution and
-documents an explicit field-name mapping so the results translate
-directly to a production Prometheus + DCGM Exporter setup:
+## What gets measured
 
-| This notebook's metric | Real DCGM field ID |
-|---|---|
-| `gpu_util_pct` | `DCGM_FI_DEV_GPU_UTIL` |
-| `mem_used_mb` | `DCGM_FI_DEV_FB_USED` |
-| `power_watts` | `DCGM_FI_DEV_POWER_USAGE` |
-| `sm_clock_mhz` | `DCGM_FI_DEV_SM_CLOCK` |
-| `mem_copy_util_pct` | `DCGM_FI_DEV_MEM_COPY_UTIL` |
+For every technique, `benchmark_runner.py` records:
 
-Tensor Core utilization (`DCGM_FI_PROF_PIPE_TENSOR_ACTIVE`) is not
-exposed via `pynvml` on consumer/T4 driver builds — this requires DCGM
-profiling permissions typically only available on A100/H100 in a
-production Kubernetes/EKS deployment, and is noted explicitly in the
-monitor's summary output rather than silently omitted.
+- **Time-to-first-token (TTFT)** and **inter-token latency**
+- **Tokens/second** (single-stream and under concurrent load via `locust`)
+- **Peak GPU memory** and **average GPU utilization** during the run (`gpu_monitor.py`)
+- **Perplexity / task accuracy** delta vs the FP16 baseline (via `lm-eval`)
+- **Model file size on disk** (checkpoint footprint)
 
-## Results (Populated After Running the Notebook)
+Results are written as CSV to `results/` and rendered as comparison charts
+(`results/*.png`) inside the notebook's final phase.
 
-The notebook writes all outputs to
-`/content/drive/MyDrive/llm-inference-benchmark-suite/benchmarks/`,
-including:
+## Known limitations
 
-- `quantization_tradeoff_table.csv` — memory / speed / perplexity / MMLU accuracy per precision
-- `combined_vllm_concurrency.csv` — TTFT/TPOT/throughput at every concurrency level, every precision
-- `locust_sweep_summary.csv` — real Locust-measured P50/P95/P99 TTFT and RPS
-- `gpu_telemetry_c32.csv` — raw GPU utilization/memory/power time series during peak load
-- `cost_per_million_tokens.csv` — cost comparison across 6 instance types
-- `BENCHMARK_REPORT.md` — consolidated markdown report combining all of the above
-
-## Updating Instance Pricing
-
-`src/config.py::CostConfig.instance_hourly_rates` hardcodes AWS
-on-demand pricing (us-east-1) as of the notebook's last run. AWS
-pricing changes periodically — update these values from the [AWS EC2
-pricing page](https://aws.amazon.com/ec2/pricing/on-demand/) before
-treating the cost report as current for a real deployment decision.
-
-## Extending This Project
-
-- **Swap the model**: change `ModelConfig.model_id` in `src/config.py`
-  to any HuggingFace causal LM. Re-run Phase 2's calibration cells for
-  the new model.
-- **Add FP8 KV cache** (A100/H100 only): set
-  `VLLMConfig.kv_cache_dtype = "fp8"` inside a GPU-architecture-gated
-  cell, mirroring the Phase 9 TensorRT-LLM guard pattern.
-- **Add speaker/task-specific eval sets**: `src/evaluate.py`'s
-  `evaluate_mmlu_subset()` accepts any MMLU `subject` string — swap in
-  a domain-relevant subject if adapting this for a specific production
-  use case (e.g. `professional_medicine` for a healthcare LLM).
+- GGUF support in vLLM itself is still explicitly marked experimental upstream and only
+  loads single-file GGUF checkpoints, so the GGUF phase benchmarks llama.cpp's native
+  server as the primary path and vLLM-GGUF as a secondary, best-effort comparison.
+- TensorRT-LLM's pip wheel pins its own `torch` build tied to a specific CUDA Toolkit
+  version; mixing it into the same environment as vLLM/GPTQModel is not attempted —
+  it always runs in its own isolated venv per the design above.

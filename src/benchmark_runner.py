@@ -1,144 +1,141 @@
-"""
-benchmark_runner.py
-====================
-Core latency/throughput measurement harness shared across every
-precision variant and serving engine tested in this suite (raw
-HuggingFace generate(), vLLM, and TensorRT-LLM).
+"""Unified benchmark client for any OpenAI-compatible server (vLLM or
+llama.cpp). Handles the FP16, GPTQ, AWQ, and GGUF phases; TensorRT-LLM
+is benchmarked separately through trtllm_bench.py's native runtime path
+since it has no HTTP server in this design.
 
-Metrics collected per request, matching the JD's explicit ask for
-"cost-per-token recommendations" and "performance cliffs":
-  - TTFT (Time To First Token): latency from request submission to the
-    first generated token becoming available. This is the metric most
-    correlated with *perceived* responsiveness in interactive use
-    (chat UIs, voice agents) -- a request with slow TTFT but fast
-    subsequent tokens still feels sluggish to a human.
-  - TPOT (Time Per Output Token): average inter-token latency after the
-    first token, i.e. steady-state decode speed.
-  - E2E latency: total wall-clock time for the full response.
-  - Throughput: tokens/second aggregated across all concurrent requests
-    at a given concurrency level.
-
-WHY track TTFT and TPOT separately rather than only E2E latency: they
-are dominated by different bottlenecks. TTFT is dominated by prefill
-compute (scales with prompt length) and queueing delay under
-concurrency. TPOT is dominated by decode-phase memory bandwidth (KV
-cache read/write) and batching efficiency.
+Reads all hyperparameters from src/config.py's CONFIG singleton — see
+that module for WHAT/WHY/EFFECT documentation on every value used here.
+Only --technique/--base_url/--model_id remain CLI args since those three
+vary per invocation (which server is currently running), while everything
+else is a fixed experiment-wide setting that belongs in config.py.
 """
 
-import asyncio
-import statistics
+from __future__ import annotations
+
+import argparse
+import csv
+import sys
 import time
-from dataclasses import dataclass, field
-from typing import Callable, List, Optional
+from pathlib import Path
+
+import httpx
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from config import CONFIG
+from gpu_monitor import GPUMonitor
 
 
-@dataclass
-class RequestResult:
-    request_id: int
-    prompt_tokens: int
-    output_tokens: int
-    ttft_s: float
-    e2e_s: float
-    success: bool
-    error: Optional[str] = None
-
-    @property
-    def tpot_s(self) -> float:
-        if self.output_tokens <= 1:
-            return 0.0
-        return (self.e2e_s - self.ttft_s) / (self.output_tokens - 1)
+def load_prompts(path):
+    with open(path) as f:
+        return [line.strip() for line in f if line.strip()]
 
 
-@dataclass
-class BenchmarkResult:
-    engine: str
-    precision: str
-    concurrency: int
-    requests: List[RequestResult] = field(default_factory=list)
-    wall_clock_s: float = 0.0
+def single_request(client, base_url, model, prompt, max_new_tokens):
+    start = time.perf_counter()
+    first_token_time = None
+    generated_tokens = 0
 
-    def _successful(self):
-        return [r for r in self.requests if r.success]
+    with client.stream(
+        "POST", f"{base_url}/completions",
+        json={"model": model, "prompt": prompt, "max_tokens": max_new_tokens, "stream": True},
+        timeout=120,
+    ) as response:
+        for line in response.iter_lines():
+            if not line or not line.startswith("data:"):
+                continue
+            if line.strip() == "data: [DONE]":
+                break
+            if first_token_time is None:
+                first_token_time = time.perf_counter()
+            generated_tokens += 1
 
-    def percentile(self, values: List[float], p: float) -> float:
-        if not values:
-            return 0.0
-        values_sorted = sorted(values)
-        idx = int(len(values_sorted) * p / 100)
-        idx = min(idx, len(values_sorted) - 1)
-        return values_sorted[idx]
+    end = time.perf_counter()
+    ttft_s = (first_token_time - start) if first_token_time else (end - start)
+    total_s = end - start
+    tokens_per_second = generated_tokens / total_s if total_s > 0 else 0.0
 
-    def summary(self) -> dict:
-        ok = self._successful()
-        if not ok:
-            return {"engine": self.engine, "precision": self.precision,
-                    "concurrency": self.concurrency, "n_success": 0,
-                    "n_failed": len(self.requests)}
-
-        ttfts = [r.ttft_s for r in ok]
-        tpots = [r.tpot_s for r in ok if r.output_tokens > 1]
-        e2es = [r.e2e_s for r in ok]
-        total_output_tokens = sum(r.output_tokens for r in ok)
-
-        return {
-            "engine": self.engine,
-            "precision": self.precision,
-            "concurrency": self.concurrency,
-            "n_success": len(ok),
-            "n_failed": len(self.requests) - len(ok),
-            "ttft_p50_ms": self.percentile(ttfts, 50) * 1000,
-            "ttft_p95_ms": self.percentile(ttfts, 95) * 1000,
-            "ttft_p99_ms": self.percentile(ttfts, 99) * 1000,
-            "tpot_p50_ms": self.percentile(tpots, 50) * 1000 if tpots else 0.0,
-            "tpot_p95_ms": self.percentile(tpots, 95) * 1000 if tpots else 0.0,
-            "e2e_p50_ms": self.percentile(e2es, 50) * 1000,
-            "e2e_p99_ms": self.percentile(e2es, 99) * 1000,
-            "aggregate_throughput_tok_s": total_output_tokens / self.wall_clock_s
-            if self.wall_clock_s > 0 else 0.0,
-        }
+    return {
+        "ttft_s": ttft_s,
+        "total_latency_s": total_s,
+        "generated_tokens": generated_tokens,
+        "tokens_per_second": tokens_per_second,
+    }
 
 
-async def run_concurrent_benchmark(
-    infer_fn: Callable,
-    prompts: List[str],
-    concurrency: int,
-    engine_name: str,
-    precision_name: str,
-) -> BenchmarkResult:
-    """
-    Fires `concurrency` requests simultaneously via asyncio, each calling
-    the engine-specific `infer_fn(prompt, request_id) -> RequestResult`.
-    """
-    semaphore = asyncio.Semaphore(concurrency)
+def benchmark_technique(technique_name, base_url, model_id, prompts, batch_sizes,
+                         max_new_tokens, num_warmup_requests, num_measured_requests):
+    results = []
+    with httpx.Client() as client:
+        for batch_size in batch_sizes:
+            print(f"[benchmark_runner] {technique_name}: batch_size={batch_size}")
 
-    async def bounded_infer(prompt, req_id):
-        async with semaphore:
-            return await infer_fn(prompt, req_id)
+            for _ in range(num_warmup_requests):
+                single_request(client, base_url, model_id, prompts[0], max_new_tokens)
 
-    t0 = time.time()
-    tasks = [
-        bounded_infer(prompt, i)
-        for i, prompt in enumerate(prompts)
-    ]
-    results = await asyncio.gather(*tasks)
-    wall_clock = time.time() - t0
+            monitor = GPUMonitor()
+            monitor.start()
 
-    return BenchmarkResult(
-        engine=engine_name,
-        precision=precision_name,
-        concurrency=concurrency,
-        requests=list(results),
-        wall_clock_s=wall_clock,
+            per_request_stats = []
+            for i in range(num_measured_requests):
+                prompt = prompts[i % len(prompts)]
+                stats = single_request(client, base_url, model_id, prompt, max_new_tokens)
+                per_request_stats.append(stats)
+
+            gpu_stats = monitor.stop()
+
+            avg_ttft = sum(s["ttft_s"] for s in per_request_stats) / len(per_request_stats)
+            avg_tps = sum(s["tokens_per_second"] for s in per_request_stats) / len(per_request_stats)
+            avg_latency = sum(s["total_latency_s"] for s in per_request_stats) / len(per_request_stats)
+
+            results.append({
+                "technique": technique_name,
+                "batch_size": batch_size,
+                "avg_ttft_s": avg_ttft,
+                "avg_latency_s": avg_latency,
+                "avg_tokens_per_second": avg_tps,
+                "num_measured_requests": num_measured_requests,
+                **gpu_stats,
+            })
+
+    return results
+
+
+def append_results_csv(results, csv_path):
+    csv_path = Path(csv_path)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    file_exists = csv_path.exists()
+
+    fieldnames = list(results[0].keys()) if results else []
+    with open(csv_path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+        for row in results:
+            writer.writerow(row)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--technique", required=True)
+    parser.add_argument("--base_url", required=True)
+    parser.add_argument("--model_id", required=True)
+    args = parser.parse_args()
+
+    bench_cfg = CONFIG.benchmark
+    prompts = load_prompts(bench_cfg.prompts_file)
+
+    results = benchmark_technique(
+        technique_name=args.technique, base_url=args.base_url, model_id=args.model_id,
+        prompts=prompts, batch_sizes=bench_cfg.batch_sizes,
+        max_new_tokens=bench_cfg.max_new_tokens,
+        num_warmup_requests=bench_cfg.num_warmup_requests,
+        num_measured_requests=bench_cfg.num_measured_requests,
     )
 
+    csv_path = Path(CONFIG.output.results_dir) / CONFIG.output.csv_name
+    append_results_csv(results, str(csv_path))
+    print(f"Appended {len(results)} rows to {csv_path}")
 
-def estimate_cost_per_million_tokens(
-    throughput_tok_s: float, instance_hourly_rate: float
-) -> float:
-    """
-    cost per 1M tokens = (instance $/hr) / (tokens/sec x 3600 sec/hr) x 1,000,000
-    """
-    if throughput_tok_s <= 0:
-        return float("inf")
-    tokens_per_hour = throughput_tok_s * 3600
-    return (instance_hourly_rate / tokens_per_hour) * 1_000_000
+
+if __name__ == "__main__":
+    main()

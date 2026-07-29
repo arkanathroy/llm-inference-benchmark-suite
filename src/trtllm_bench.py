@@ -1,80 +1,104 @@
-"""
-trtllm_bench.py
-================
-TensorRT-LLM concurrency benchmark, mirroring benchmark_runner.py's
-methodology but using TRT-LLM's ModelRunner API instead of vLLM's
-AsyncLLMEngine. Requires an Ampere+ GPU (A100/H100) -- gated in the
-notebook's Phase 9 by a GPU_ARCH check since TRT-LLM engine compilation
-targets a specific GPU architecture at build time and will not run on
-a T4 (Turing) even if installed.
+"""Native TensorRT-LLM throughput/latency benchmark harness.
+
+Runs inside envs/trtllm/venv, against a compiled engine produced by
+src/build_trtllm_engine.py. TensorRT-LLM engines are invoked through
+their own native Python runtime API (tensorrt_llm.runtime), since vLLM
+does not execute compiled TRT engines directly.
+
+Reads all hyperparameters from src/config.py's CONFIG singleton — see
+that module for WHAT/WHY/EFFECT documentation on every value used here.
 """
 
+from __future__ import annotations
+
+import argparse
+import json
+import sys
 import time
-from benchmark_runner import RequestResult, BenchmarkResult
+from pathlib import Path
+
+from transformers import AutoTokenizer
+from tensorrt_llm.runtime import ModelRunner
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from config import CONFIG
+from gpu_monitor import GPUMonitor
 
 
-def trtllm_infer(runner, tokenizer, prompt: str, request_id: int, max_tokens: int = 256) -> RequestResult:
-    """
-    Single-request inference against a compiled TRT-LLM engine.
-
-    WHY streaming callback for TTFT here too (mirroring vllm_infer in the
-    notebook): TRT-LLM's ModelRunner.generate() supports a streaming mode
-    that yields partial token sequences -- the first yield's timestamp
-    marks TTFT identically to the vLLM measurement, keeping the two
-    engines' TTFT semantics comparable in the final report.
-    """
-    input_ids = tokenizer(prompt, return_tensors="pt").input_ids.cuda()
-
-    t0 = time.time()
-    ttft = None
-    output_ids = None
-
-    for partial_output in runner.generate(
-        input_ids,
-        max_new_tokens=max_tokens,
-        end_id=tokenizer.eos_token_id,
-        pad_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
-        streaming=True,
-    ):
-        if ttft is None:
-            ttft = time.time() - t0
-        output_ids = partial_output
-
-    e2e = time.time() - t0
-    n_output_tokens = output_ids.shape[-1] - input_ids.shape[-1] if output_ids is not None else 0
-
-    return RequestResult(
-        request_id=request_id,
-        prompt_tokens=input_ids.shape[-1],
-        output_tokens=n_output_tokens,
-        ttft_s=ttft or 0.0,
-        e2e_s=e2e,
-        success=True,
-    )
+def load_prompts(path):
+    with open(path) as f:
+        return [line.strip() for line in f if line.strip()]
 
 
-def run_trtllm_concurrency_sweep(runner, tokenizer, prompts, concurrency_levels) -> list:
-    """
-    Note: TRT-LLM's ModelRunner is synchronous (not asyncio-native like
-    vLLM's engine), so true request-level concurrency is achieved via
-    TRT-LLM's own internal in-flight batching manager rather than Python-
-    level asyncio.gather -- requests are submitted in a tight loop and the
-    runner's scheduler handles batching internally, matching how a real
-    Triton + TRT-LLM backend deployment would receive concurrent gRPC
-    requests in production.
-    """
-    results = []
-    for concurrency in concurrency_levels:
-        subset = prompts[:max(concurrency * 2, 8)]
-        t0 = time.time()
-        request_results = [
-            trtllm_infer(runner, tokenizer, p, i) for i, p in enumerate(subset)
-        ]
-        wall_clock = time.time() - t0
+def benchmark_batch_size(runner, tokenizer, prompts, batch_size, max_new_tokens,
+                          num_measured_requests, num_warmup_requests):
+    batch_prompts = (prompts * ((batch_size // len(prompts)) + 1))[:batch_size]
+    input_ids = [tokenizer.encode(p, return_tensors="pt")[0] for p in batch_prompts]
 
-        bench_result = BenchmarkResult(
-            engine="trtllm", precision="fp16", concurrency=concurrency,
-            requests=request_results, wall_clock_s=wall_clock,
+    for _ in range(num_warmup_requests):
+        runner.generate(batch_input_ids=input_ids, max_new_tokens=max_new_tokens)
+
+    latencies_s = []
+    total_tokens_generated = 0
+
+    monitor = GPUMonitor()
+    monitor.start()
+
+    for _ in range(num_measured_requests):
+        start = time.perf_counter()
+        outputs = runner.generate(batch_input_ids=input_ids, max_new_tokens=max_new_tokens)
+        elapsed = time.perf_counter() - start
+        latencies_s.append(elapsed)
+        for seq in outputs:
+            total_tokens_generated += len(seq) - len(input_ids[0])
+
+    gpu_stats = monitor.stop()
+
+    total_time_s = sum(latencies_s)
+    tokens_per_second = total_tokens_generated / total_time_s if total_time_s > 0 else 0.0
+    avg_latency_s = total_time_s / len(latencies_s)
+
+    return {
+        "technique": "trtllm",
+        "batch_size": batch_size,
+        "avg_latency_s": avg_latency_s,
+        "tokens_per_second": tokens_per_second,
+        "num_measured_requests": num_measured_requests,
+        **gpu_stats,
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--engine_dir", required=True)
+    parser.add_argument("--output", default="results/trtllm_benchmark.json")
+    args = parser.parse_args()
+
+    bench_cfg = CONFIG.benchmark
+    tokenizer = AutoTokenizer.from_pretrained(CONFIG.model.hf_repo)
+    prompts = load_prompts(bench_cfg.prompts_file)
+
+    runner = ModelRunner.from_dir(args.engine_dir)
+
+    all_results = []
+    for batch_size in bench_cfg.batch_sizes:
+        print(f"[trtllm_bench] Benchmarking batch_size={batch_size} ...")
+        result = benchmark_batch_size(
+            runner=runner, tokenizer=tokenizer, prompts=prompts, batch_size=batch_size,
+            max_new_tokens=bench_cfg.max_new_tokens,
+            num_measured_requests=bench_cfg.num_measured_requests,
+            num_warmup_requests=bench_cfg.num_warmup_requests,
         )
-        results.append(bench_result.summary())
-    return results
+        all_results.append(result)
+        print(json.dumps(result, indent=2, default=str))
+
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w") as f:
+        json.dump(all_results, f, indent=2, default=str)
+
+    print(f"TensorRT-LLM benchmark results written to {output_path}")
+
+
+if __name__ == "__main__":
+    main()

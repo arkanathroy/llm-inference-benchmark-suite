@@ -1,0 +1,5 @@
+Explain the concept of attention in transformer neural networks in three paragraphs.
+Write a short story about a robot who learns to paint.
+Summarize the causes of the French Revolution in five bullet points.
+What are the trade-offs between REST and GraphQL APIs?
+Describe how continuous batching improves LLM serving throughput.
