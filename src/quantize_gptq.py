@@ -21,7 +21,7 @@ from config import CONFIG
 
 
 def build_calibration_samples(tokenizer, n_samples=128):
-    dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
+    dataset = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="train")
     texts = [t for t in dataset["text"] if len(t.strip()) > 200][:n_samples]
     return texts
 
