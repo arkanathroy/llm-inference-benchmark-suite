@@ -1,19 +1,21 @@
 """Thin subprocess bridge for invoking a script inside one of the isolated
 per-technique virtual environments (envs/<name>/venv).
 
-IMPORTANT: subprocess stdout/stderr do not reliably surface in Colab's
-notebook cell output the way `!shell` magic does (Colab only captures the
-parent kernel's sys.stdout, not raw OS file descriptors inherited by a
-child process). To avoid silently losing the real traceback on failure,
-this module always captures output internally and re-prints it explicitly
-before raising, so errors are visible directly in the cell that called
-run_in_env instead of only showing a generic CalledProcessError.
+Streams the child process's stdout/stderr live, line by line, as it
+happens — rather than buffering with subprocess.run(capture_output=True)
+and only showing output once the whole process exits. That buffering
+was the root cause of long silent gaps in Colab during benchmark runs:
+scripts like benchmark_runner.py were producing progress output the
+whole time, but none of it reached the notebook cell until the process
+was already finished. All streamed lines are also collected so the
+full output is still available/re-printable on failure.
 """
 
 from __future__ import annotations
 
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -29,19 +31,44 @@ def venv_python(env_name: str) -> Path:
     return py
 
 
+def _stream_pipe(pipe, sink, collected):
+    for line in iter(pipe.readline, ""):
+        sink.write(line)
+        sink.flush()
+        collected.append(line)
+    pipe.close()
+
+
 def _run(cmd, check):
     print(f"[env_runner] $ {' '.join(cmd)}", file=sys.stderr)
-    result = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True)
+    import os
+    child_env = os.environ.copy()
+    child_env["PYTHONUNBUFFERED"] = "1"
 
-    if result.stdout:
-        print(result.stdout, end="")
-    if result.stderr:
-        print(result.stderr, end="", file=sys.stderr)
+    proc = subprocess.Popen(
+        cmd, cwd=REPO_ROOT, text=True, env=child_env,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        bufsize=1,
+    )
 
-    if check and result.returncode != 0:
+    stdout_lines, stderr_lines = [], []
+    t_out = threading.Thread(target=_stream_pipe, args=(proc.stdout, sys.stdout, stdout_lines))
+    t_err = threading.Thread(target=_stream_pipe, args=(proc.stderr, sys.stderr, stderr_lines))
+    t_out.start()
+    t_err.start()
+
+    returncode = proc.wait()
+    t_out.join()
+    t_err.join()
+
+    result = subprocess.CompletedProcess(
+        cmd, returncode, stdout="".join(stdout_lines), stderr="".join(stderr_lines),
+    )
+
+    if check and returncode != 0:
         raise RuntimeError(
-            f"Command failed with exit code {result.returncode}: {' '.join(cmd)}\n"
-            f"See captured stdout/stderr printed above for the real traceback."
+            f"Command failed with exit code {returncode}: {' '.join(cmd)}\n"
+            f"Full stdout/stderr was streamed live above as the process ran."
         )
     return result
 
