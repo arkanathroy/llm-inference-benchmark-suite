@@ -18,7 +18,7 @@ fi
 source "$ENV_DIR/bin/activate"
 pip install -q --upgrade pip
 pip install -q vllm
-pip install -q autoawq --no-build-isolation
+pip install -q llmcompressor
 pip install -q "transformers[sentencepiece]" accelerate
 pip install -q pynvml nvidia-ml-py pandas numpy matplotlib plotly
 pip install -q locust fastapi uvicorn httpx aiohttp pydantic python-dotenv rich tqdm
