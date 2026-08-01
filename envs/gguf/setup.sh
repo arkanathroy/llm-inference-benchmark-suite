@@ -23,7 +23,7 @@ pip install -q llama-cpp-python --no-cache-dir
 pip install -q huggingface_hub gguf sentencepiece protobuf numpy
 pip install -q pynvml nvidia-ml-py pandas matplotlib plotly
 pip install -q locust fastapi uvicorn httpx aiohttp pydantic python-dotenv rich tqdm
-pip install -q lm-eval evaluate datasets scikit-learn transformers accelerate
+pip install -q "lm-eval[api]" evaluate datasets scikit-learn transformers accelerate
 if [ ! -d "envs/gguf/llama.cpp" ]; then
   git clone --depth 1 https://github.com/ggml-org/llama.cpp.git envs/gguf/llama.cpp
 fi

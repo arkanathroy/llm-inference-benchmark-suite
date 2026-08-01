@@ -22,6 +22,6 @@ pip install -q llmcompressor
 pip install -q "transformers[sentencepiece]" accelerate
 pip install -q pynvml nvidia-ml-py pandas numpy matplotlib plotly
 pip install -q locust fastapi uvicorn httpx aiohttp pydantic python-dotenv rich tqdm
-pip install -q lm-eval evaluate datasets scikit-learn
+pip install -q "lm-eval[api]" evaluate datasets scikit-learn
 deactivate
 echo "awq environment ready at $ENV_DIR"
