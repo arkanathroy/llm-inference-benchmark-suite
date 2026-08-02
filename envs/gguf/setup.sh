@@ -18,6 +18,7 @@ fi
 source "$ENV_DIR/bin/activate"
 pip install -q --upgrade pip
 export CMAKE_ARGS="-DGGML_CUDA=on"
+export CMAKE_BUILD_PARALLEL_LEVEL=1
 export FORCE_CMAKE=1
 pip install -q llama-cpp-python --no-cache-dir
 pip install -q huggingface_hub gguf sentencepiece protobuf numpy

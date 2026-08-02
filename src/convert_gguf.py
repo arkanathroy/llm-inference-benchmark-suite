@@ -27,7 +27,7 @@ def build_llama_quantize_binary():
     build_dir = LLAMA_CPP_DIR / "build"
     build_dir.mkdir(exist_ok=True)
     subprocess.run(["cmake", "-B", str(build_dir), "-DGGML_CUDA=ON"], cwd=LLAMA_CPP_DIR, check=True)
-    subprocess.run(["cmake", "--build", str(build_dir), "--config", "Release", "-j"], cwd=LLAMA_CPP_DIR, check=True)
+    subprocess.run(["cmake", "--build", str(build_dir), "--config", "Release", "-j", "2"], cwd=LLAMA_CPP_DIR, check=True)
     binary = build_dir / "bin" / "llama-quantize"
     if not binary.exists():
         raise FileNotFoundError(f"Expected llama-quantize binary at {binary}")
